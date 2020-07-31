@@ -1,9 +1,8 @@
 package gost
 
 import (
-	"bytes"
+	"context"
 	"errors"
-	"fmt"
 	"net"
 	"time"
 
@@ -15,14 +14,16 @@ var (
 	ErrEmptyChain = errors.New("empty chain")
 )
 
-// Chain is a proxy chain that holds a list of proxy nodes.
+// Chain is a proxy chain that holds a list of proxy node groups.
 type Chain struct {
 	isRoute    bool
 	Retries    int
 	nodeGroups []*NodeGroup
+	route      []Node // nodes in the selected route
 }
 
 // NewChain creates a proxy chain with a list of proxy nodes.
+// It creates the node groups automatically, one group per node.
 func NewChain(nodes ...Node) *Chain {
 	chain := &Chain{}
 	for _, node := range nodes {
@@ -31,6 +32,8 @@ func NewChain(nodes ...Node) *Chain {
 	return chain
 }
 
+// newRoute creates a chain route.
+// a chain route is the final route after node selection.
 func newRoute(nodes ...Node) *Chain {
 	chain := NewChain(nodes...)
 	chain.isRoute = true
@@ -38,7 +41,7 @@ func newRoute(nodes ...Node) *Chain {
 }
 
 // Nodes returns the proxy nodes that the chain holds.
-// If a node is a node group, the first node in the group will be returned.
+// The first node in each group will be returned.
 func (c *Chain) Nodes() (nodes []Node) {
 	for _, group := range c.nodeGroups {
 		if ns := group.Nodes(); len(ns) > 0 {
@@ -61,7 +64,7 @@ func (c *Chain) LastNode() Node {
 		return Node{}
 	}
 	group := c.nodeGroups[len(c.nodeGroups)-1]
-	return group.nodes[0].Clone()
+	return group.GetNode(0)
 }
 
 // LastNodeGroup returns the last group of the group list.
@@ -98,9 +101,14 @@ func (c *Chain) IsEmpty() bool {
 	return c == nil || len(c.nodeGroups) == 0
 }
 
-// Dial connects to the target address addr through the chain.
-// If the chain is empty, it will use the net.Dial directly.
-func (c *Chain) Dial(addr string, opts ...ChainOption) (conn net.Conn, err error) {
+// Dial connects to the target TCP address addr through the chain.
+// Deprecated: use DialContext instead.
+func (c *Chain) Dial(address string, opts ...ChainOption) (conn net.Conn, err error) {
+	return c.DialContext(context.Background(), "tcp", address, opts...)
+}
+
+// DialContext connects to the address on the named network using the provided context.
+func (c *Chain) DialContext(ctx context.Context, network, address string, opts ...ChainOption) (conn net.Conn, err error) {
 	options := &ChainOptions{}
 	for _, opt := range opts {
 		opt(options)
@@ -115,7 +123,7 @@ func (c *Chain) Dial(addr string, opts ...ChainOption) (conn net.Conn, err error
 	}
 
 	for i := 0; i < retries; i++ {
-		conn, err = c.dialWithOptions(addr, options)
+		conn, err = c.dialWithOptions(ctx, network, address, options)
 		if err == nil {
 			break
 		}
@@ -123,27 +131,47 @@ func (c *Chain) Dial(addr string, opts ...ChainOption) (conn net.Conn, err error
 	return
 }
 
-func (c *Chain) dialWithOptions(addr string, options *ChainOptions) (net.Conn, error) {
+func (c *Chain) dialWithOptions(ctx context.Context, network, address string, options *ChainOptions) (net.Conn, error) {
 	if options == nil {
 		options = &ChainOptions{}
 	}
-	route, err := c.selectRouteFor(addr)
+	route, err := c.selectRouteFor(address)
 	if err != nil {
 		return nil, err
 	}
 
-	addr = c.resolve(addr, options.Resolver, options.Hosts)
+	ipAddr := address
+	if address != "" {
+		ipAddr = c.resolve(address, options.Resolver, options.Hosts)
+	}
+
+	timeout := options.Timeout
+	if timeout <= 0 {
+		timeout = DialTimeout
+	}
 
 	if route.IsEmpty() {
-		return net.DialTimeout("tcp", addr, options.Timeout)
+		switch network {
+		case "udp", "udp4", "udp6":
+			if address == "" {
+				return net.ListenUDP(network, nil)
+			}
+		default:
+		}
+		d := &net.Dialer{
+			Timeout: timeout,
+			// LocalAddr: laddr, // TODO: optional local address
+		}
+		return d.DialContext(ctx, network, ipAddr)
 	}
 
-	conn, err := route.getConn()
+	conn, err := route.getConn(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	cc, err := route.LastNode().Client.Connect(conn, addr)
+	cOpts := append([]ConnectOption{AddrConnectOption(address)}, route.LastNode().ConnectOptions...)
+	cc, err := route.LastNode().Client.ConnectContext(ctx, conn, network, ipAddr, cOpts...)
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -151,7 +179,7 @@ func (c *Chain) dialWithOptions(addr string, options *ChainOptions) (net.Conn, e
 	return cc, nil
 }
 
-func (c *Chain) resolve(addr string, resolver Resolver, hosts *Hosts) string {
+func (*Chain) resolve(addr string, resolver Resolver, hosts *Hosts) string {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return addr
@@ -173,12 +201,13 @@ func (c *Chain) resolve(addr string, resolver Resolver, hosts *Hosts) string {
 }
 
 // Conn obtains a handshaked connection to the last node of the chain.
-// If the chain is empty, it returns an ErrEmptyChain error.
 func (c *Chain) Conn(opts ...ChainOption) (conn net.Conn, err error) {
 	options := &ChainOptions{}
 	for _, opt := range opts {
 		opt(options)
 	}
+
+	ctx := context.Background()
 
 	retries := 1
 	if c != nil && c.Retries > 0 {
@@ -194,19 +223,16 @@ func (c *Chain) Conn(opts ...ChainOption) (conn net.Conn, err error) {
 		if err != nil {
 			continue
 		}
-		conn, err = route.getConn()
-		if err != nil {
-			log.Log(err)
-			continue
+		conn, err = route.getConn(ctx)
+		if err == nil {
+			break
 		}
-
-		break
 	}
 	return
 }
 
 // getConn obtains a connection to the last node of the chain.
-func (c *Chain) getConn() (conn net.Conn, err error) {
+func (c *Chain) getConn(ctx context.Context) (conn net.Conn, err error) {
 	if c.IsEmpty() {
 		err = ErrEmptyChain
 		return
@@ -214,14 +240,15 @@ func (c *Chain) getConn() (conn net.Conn, err error) {
 	nodes := c.Nodes()
 	node := nodes[0]
 
-	cn, err := node.Client.Dial(node.Addr, node.DialOptions...)
+	cc, err := node.Client.Dial(node.Addr, node.DialOptions...)
 	if err != nil {
 		node.MarkDead()
 		return
 	}
 
-	cn, err = node.Client.Handshake(cn, node.HandshakeOptions...)
+	cn, err := node.Client.Handshake(cc, node.HandshakeOptions...)
 	if err != nil {
+		cc.Close()
 		node.MarkDead()
 		return
 	}
@@ -230,7 +257,7 @@ func (c *Chain) getConn() (conn net.Conn, err error) {
 	preNode := node
 	for _, node := range nodes[1:] {
 		var cc net.Conn
-		cc, err = preNode.Client.Connect(cn, node.Addr)
+		cc, err = preNode.Client.ConnectContext(ctx, cn, "tcp", node.Addr, preNode.ConnectOptions...)
 		if err != nil {
 			cn.Close()
 			node.MarkDead()
@@ -253,45 +280,20 @@ func (c *Chain) getConn() (conn net.Conn, err error) {
 }
 
 func (c *Chain) selectRoute() (route *Chain, err error) {
-	if c.IsEmpty() || c.isRoute {
-		return c, nil
-	}
-
-	buf := bytes.Buffer{}
-	route = newRoute()
-
-	for _, group := range c.nodeGroups {
-		node, err := group.Next()
-		if err != nil {
-			return nil, err
-		}
-		buf.WriteString(fmt.Sprintf("%s -> ", node.String()))
-
-		if node.Client.Transporter.Multiplex() {
-			node.DialOptions = append(node.DialOptions,
-				ChainDialOption(route),
-			)
-			route = newRoute() // cutoff the chain for multiplex.
-		}
-
-		route.AddNode(node)
-	}
-	route.Retries = c.Retries
-
-	if Debug {
-		log.Log("select route:", buf.String())
-	}
-	return
+	return c.selectRouteFor("")
 }
 
 // selectRouteFor selects route with bypass testing.
 func (c *Chain) selectRouteFor(addr string) (route *Chain, err error) {
-	if c.IsEmpty() || c.isRoute {
+	if c.IsEmpty() {
+		return newRoute(), nil
+	}
+	if c.isRoute {
 		return c, nil
 	}
 
-	buf := bytes.Buffer{}
 	route = newRoute()
+	var nl []Node
 
 	for _, group := range c.nodeGroups {
 		var node Node
@@ -301,30 +303,22 @@ func (c *Chain) selectRouteFor(addr string) (route *Chain, err error) {
 		}
 
 		if node.Bypass.Contains(addr) {
-			if Debug {
-				buf.WriteString(fmt.Sprintf("[bypass]%s -> %s", node.String(), addr))
-				log.Log("[route]", buf.String())
-			}
-			return
+			break
 		}
-
-		buf.WriteString(fmt.Sprintf("%s -> ", node.String()))
 
 		if node.Client.Transporter.Multiplex() {
 			node.DialOptions = append(node.DialOptions,
 				ChainDialOption(route),
 			)
-			route = newRoute() // cutoff the chain for multiplex.
+			route = newRoute() // cutoff the chain for multiplex node.
 		}
 
 		route.AddNode(node)
+		nl = append(nl, node)
 	}
-	route.Retries = c.Retries
 
-	if Debug {
-		buf.WriteString(addr)
-		log.Log("[route]", buf.String())
-	}
+	route.route = nl
+
 	return
 }
 

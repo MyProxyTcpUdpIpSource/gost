@@ -3,15 +3,20 @@ package gost
 import (
 	"io"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/go-log/log"
 )
 
+// Accepter represents a network endpoint that can accept connection from peer.
+type Accepter interface {
+	Accept() (net.Conn, error)
+}
+
 // Server is a proxy server.
 type Server struct {
 	Listener Listener
+	Handler  Handler
 	options  *ServerOptions
 }
 
@@ -46,6 +51,10 @@ func (s *Server) Serve(h Handler, opts ...ServerOption) error {
 		}
 		s.Listener = ln
 	}
+
+	if h == nil {
+		h = s.Handler
+	}
 	if h == nil {
 		h = HTTPHandler()
 	}
@@ -72,96 +81,48 @@ func (s *Server) Serve(h Handler, opts ...ServerOption) error {
 		}
 		tempDelay = 0
 
-		if s.options.Bypass.Contains(conn.RemoteAddr().String()) {
-			log.Log("[bypass]", conn.RemoteAddr())
-			conn.Close()
-			continue
-		}
-
 		go h.Handle(conn)
 	}
 }
 
+// Run starts to serve.
+func (s *Server) Run() error {
+	return s.Serve(s.Handler)
+}
+
 // ServerOptions holds the options for Server.
 type ServerOptions struct {
-	Bypass *Bypass
 }
 
 // ServerOption allows a common way to set server options.
 type ServerOption func(opts *ServerOptions)
-
-// BypassServerOption sets the bypass option of ServerOptions.
-func BypassServerOption(bypass *Bypass) ServerOption {
-	return func(opts *ServerOptions) {
-		opts.Bypass = bypass
-	}
-}
 
 // Listener is a proxy server listener, just like a net.Listener.
 type Listener interface {
 	net.Listener
 }
 
-type tcpListener struct {
-	net.Listener
-}
-
-// TCPListener creates a Listener for TCP proxy server.
-func TCPListener(addr string) (Listener, error) {
-	laddr, err := net.ResolveTCPAddr("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	ln, err := net.ListenTCP("tcp", laddr)
-	if err != nil {
-		return nil, err
-	}
-	return &tcpListener{Listener: tcpKeepAliveListener{ln}}, nil
-}
-
-type tcpKeepAliveListener struct {
-	*net.TCPListener
-}
-
-func (ln tcpKeepAliveListener) Accept() (c net.Conn, err error) {
-	tc, err := ln.AcceptTCP()
-	if err != nil {
-		return
-	}
-	tc.SetKeepAlive(true)
-	tc.SetKeepAlivePeriod(KeepAliveTime)
-	return tc, nil
-}
-
-var (
-	trPool = sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 32*1024)
-		},
-	}
-)
-
 func transport(rw1, rw2 io.ReadWriter) error {
 	errc := make(chan error, 1)
 	go func() {
-		buf := trPool.Get().([]byte)
-		defer trPool.Put(buf)
-
-		_, err := io.CopyBuffer(rw1, rw2, buf)
-		errc <- err
+		errc <- copyBuffer(rw1, rw2)
 	}()
 
 	go func() {
-		buf := trPool.Get().([]byte)
-		defer trPool.Put(buf)
-
-		_, err := io.CopyBuffer(rw2, rw1, buf)
-		errc <- err
+		errc <- copyBuffer(rw2, rw1)
 	}()
 
 	err := <-errc
 	if err != nil && err == io.EOF {
 		err = nil
 	}
+	return err
+}
+
+func copyBuffer(dst io.Writer, src io.Reader) error {
+	buf := lPool.Get().([]byte)
+	defer lPool.Put(buf)
+
+	_, err := io.CopyBuffer(dst, src, buf)
 	return err
 }

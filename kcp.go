@@ -15,7 +15,8 @@ import (
 
 	"github.com/go-log/log"
 	"github.com/klauspost/compress/snappy"
-	"gopkg.in/xtaci/kcp-go.v2"
+	"github.com/xtaci/tcpraw"
+	"gopkg.in/xtaci/kcp-go.v4"
 	"gopkg.in/xtaci/smux.v1"
 )
 
@@ -46,27 +47,26 @@ type KCPConfig struct {
 	SnmpLog      string `json:"snmplog"`
 	SnmpPeriod   int    `json:"snmpperiod"`
 	Signal       bool   `json:"signal"` // Signal enables the signal SIGUSR1 feature.
+	TCP          bool   `json:"tcp"`
 }
 
 // Init initializes the KCP config.
 func (c *KCPConfig) Init() {
 	switch c.Mode {
 	case "normal":
-		c.NoDelay, c.Interval, c.Resend, c.NoCongestion = 0, 50, 2, 1
-	case "fast2":
-		c.NoDelay, c.Interval, c.Resend, c.NoCongestion = 1, 30, 2, 1
-	case "fast3":
-		c.NoDelay, c.Interval, c.Resend, c.NoCongestion = 1, 20, 2, 1
-	case "fast":
-		fallthrough
-	default:
 		c.NoDelay, c.Interval, c.Resend, c.NoCongestion = 0, 40, 2, 1
+	case "fast":
+		c.NoDelay, c.Interval, c.Resend, c.NoCongestion = 0, 30, 2, 1
+	case "fast2":
+		c.NoDelay, c.Interval, c.Resend, c.NoCongestion = 1, 20, 2, 1
+	case "fast3":
+		c.NoDelay, c.Interval, c.Resend, c.NoCongestion = 1, 10, 2, 1
 	}
 }
 
 var (
 	// DefaultKCPConfig is the default KCP config.
-	DefaultKCPConfig = &KCPConfig{
+	DefaultKCPConfig = KCPConfig{
 		Key:          "it's a secrect",
 		Crypt:        "aes",
 		Mode:         "fast",
@@ -87,6 +87,7 @@ var (
 		SnmpLog:      "",
 		SnmpPeriod:   60,
 		Signal:       false,
+		TCP:          false,
 	}
 )
 
@@ -99,7 +100,8 @@ type kcpTransporter struct {
 // KCPTransporter creates a Transporter that is used by KCP proxy client.
 func KCPTransporter(config *KCPConfig) Transporter {
 	if config == nil {
-		config = DefaultKCPConfig
+		config = &KCPConfig{}
+		*config = DefaultKCPConfig
 	}
 	config.Init()
 
@@ -115,19 +117,39 @@ func KCPTransporter(config *KCPConfig) Transporter {
 }
 
 func (tr *kcpTransporter) Dial(addr string, options ...DialOption) (conn net.Conn, err error) {
-	uaddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return
+	opts := &DialOptions{}
+	for _, option := range options {
+		option(opts)
 	}
 
 	tr.sessionMutex.Lock()
 	defer tr.sessionMutex.Unlock()
 
 	session, ok := tr.sessions[addr]
+	if session != nil && session.session != nil && session.session.IsClosed() {
+		session.Close()
+		delete(tr.sessions, addr) // session is dead
+		ok = false
+	}
 	if !ok {
-		conn, err = net.DialUDP("udp", nil, uaddr)
+		raddr, err := net.ResolveUDPAddr("udp", addr)
 		if err != nil {
-			return
+			return nil, err
+		}
+		if tr.config.TCP {
+			pc, err := tcpraw.Dial("tcp", addr)
+			if err != nil {
+				return nil, err
+			}
+			conn = &fakeTCPConn{
+				raddr:      raddr,
+				PacketConn: pc,
+			}
+		} else {
+			conn, err = net.ListenUDP("udp", nil)
+			if err != nil {
+				return nil, err
+			}
 		}
 		session = &muxSession{conn: conn}
 		tr.sessions[addr] = session
@@ -146,6 +168,13 @@ func (tr *kcpTransporter) Handshake(conn net.Conn, options ...HandshakeOption) (
 	}
 	tr.sessionMutex.Lock()
 	defer tr.sessionMutex.Unlock()
+
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = HandshakeTimeout
+	}
+	conn.SetDeadline(time.Now().Add(timeout))
+	defer conn.SetDeadline(time.Time{})
 
 	session, ok := tr.sessions[opts.Addr]
 	if !ok || session.session == nil {
@@ -169,29 +198,30 @@ func (tr *kcpTransporter) Handshake(conn net.Conn, options ...HandshakeOption) (
 }
 
 func (tr *kcpTransporter) initSession(addr string, conn net.Conn, config *KCPConfig) (*muxSession, error) {
-	udpConn, ok := conn.(*net.UDPConn)
+	pc, ok := conn.(net.PacketConn)
 	if !ok {
 		return nil, errors.New("kcp: wrong connection type")
 	}
 
 	kcpconn, err := kcp.NewConn(addr,
 		blockCrypt(config.Key, config.Crypt, KCPSalt),
-		config.DataShard, config.ParityShard,
-		&kcp.ConnectedUDPConn{UDPConn: udpConn, Conn: udpConn})
+		config.DataShard, config.ParityShard, pc)
 	if err != nil {
 		return nil, err
 	}
 
 	kcpconn.SetStreamMode(true)
+	kcpconn.SetWriteDelay(false)
 	kcpconn.SetNoDelay(config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
 	kcpconn.SetWindowSize(config.SndWnd, config.RcvWnd)
 	kcpconn.SetMtu(config.MTU)
 	kcpconn.SetACKNoDelay(config.AckNodelay)
-	kcpconn.SetKeepAlive(config.KeepAlive)
 
-	// if err := kcpconn.SetDSCP(config.DSCP); err != nil {
-	// 	log.Log("[kcp]", err)
-	// }
+	if config.DSCP > 0 {
+		if err := kcpconn.SetDSCP(config.DSCP); err != nil {
+			log.Log("[kcp]", err)
+		}
+	}
 	if err := kcpconn.SetReadBuffer(config.SockBuf); err != nil {
 		log.Log("[kcp]", err)
 	}
@@ -202,6 +232,7 @@ func (tr *kcpTransporter) initSession(addr string, conn net.Conn, config *KCPCon
 	// stream multiplex
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.MaxReceiveBuffer = config.SockBuf
+	smuxConfig.KeepAliveInterval = time.Duration(config.KeepAlive) * time.Second
 	var cc net.Conn = kcpconn
 	if !config.NoComp {
 		cc = newCompStreamConn(kcpconn)
@@ -227,18 +258,36 @@ type kcpListener struct {
 // KCPListener creates a Listener for KCP proxy server.
 func KCPListener(addr string, config *KCPConfig) (Listener, error) {
 	if config == nil {
-		config = DefaultKCPConfig
+		config = &KCPConfig{}
+		*config = DefaultKCPConfig
 	}
 	config.Init()
 
-	ln, err := kcp.ListenWithOptions(addr,
-		blockCrypt(config.Key, config.Crypt, KCPSalt), config.DataShard, config.ParityShard)
+	var err error
+	var ln *kcp.Listener
+	if config.TCP {
+		var conn net.PacketConn
+		conn, err = tcpraw.Listen("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		ln, err = kcp.ServeConn(
+			blockCrypt(config.Key, config.Crypt, KCPSalt), config.DataShard, config.ParityShard, conn)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		ln, err = kcp.ListenWithOptions(addr,
+			blockCrypt(config.Key, config.Crypt, KCPSalt), config.DataShard, config.ParityShard)
+	}
 	if err != nil {
 		return nil, err
 	}
-	// if err = ln.SetDSCP(config.DSCP); err != nil {
-	// 	log.Log("[kcp]", err)
-	// }
+	if config.DSCP > 0 {
+		if err = ln.SetDSCP(config.DSCP); err != nil {
+			log.Log("[kcp]", err)
+		}
+	}
 	if err = ln.SetReadBuffer(config.SockBuf); err != nil {
 		log.Log("[kcp]", err)
 	}
@@ -272,11 +321,11 @@ func (l *kcpListener) listenLoop() {
 			return
 		}
 		conn.SetStreamMode(true)
+		conn.SetWriteDelay(false)
 		conn.SetNoDelay(l.config.NoDelay, l.config.Interval, l.config.Resend, l.config.NoCongestion)
 		conn.SetMtu(l.config.MTU)
 		conn.SetWindowSize(l.config.SndWnd, l.config.RcvWnd)
 		conn.SetACKNoDelay(l.config.AckNodelay)
-		conn.SetKeepAlive(l.config.KeepAlive)
 		go l.mux(conn)
 	}
 }
@@ -284,6 +333,7 @@ func (l *kcpListener) listenLoop() {
 func (l *kcpListener) mux(conn net.Conn) {
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.MaxReceiveBuffer = l.config.SockBuf
+	smuxConfig.KeepAliveInterval = time.Duration(l.config.KeepAlive) * time.Second
 
 	log.Logf("[kcp] %s - %s", conn.RemoteAddr(), l.Addr())
 
@@ -341,6 +391,8 @@ func blockCrypt(key, crypt, salt string) (block kcp.BlockCrypt) {
 	pass := pbkdf2.Key([]byte(key), []byte(salt), 4096, 32, sha1.New)
 
 	switch crypt {
+	case "sm4":
+		block, _ = kcp.NewSM4BlockCrypt(pass[:16])
 	case "tea":
 		block, _ = kcp.NewTEABlockCrypt(pass[:16])
 	case "xor":
